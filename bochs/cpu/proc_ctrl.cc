@@ -95,11 +95,14 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::CPUID(bxInstruction_c *i)
 {
   Bit64u laddr = RIP + BX_CPU_THIS_PTR sregs[BX_SEG_REG_CS].cache.u.segment.base;
 
+  // BOCHSERVISOR
   // Terminate so we handle in the hypervisor
   // There are some CPUIDs called in the BIOS that we cannot run in the
   // hypervisor and this is a hack because I don't dump CPUID tables.
   if(laddr < 0xc0000 || laddr >= 0x100000 ) {
-    printf("BYPASSING CPUID\n");
+    // Undo that this instruction executed. Bochs updates RIP prior to calling
+    // this callback so we need to do this.
+    RIP -= i->ilen();
     longjmp(BX_CPU_THIS_PTR jmp_buf_env, 1);
   }
 
@@ -663,6 +666,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::RDTSC(bxInstruction_c *i)
 #endif
 
   // return ticks
+  //BX_CPU_THIS_PTR set_TSC(__rdtsc());
   Bit64u ticks = BX_CPU_THIS_PTR get_TSC();
 
   RAX = GET32L(ticks);
@@ -707,6 +711,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::RDTSCP(bxInstruction_c *i)
 #endif
 
   // return ticks
+  //BX_CPU_THIS_PTR set_TSC(__rdtsc());
   Bit64u ticks = BX_CPU_THIS_PTR get_TSC();
 
   RAX = GET32L(ticks);

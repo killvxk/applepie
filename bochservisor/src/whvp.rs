@@ -17,6 +17,41 @@ pub const PERM_WRITE:   i32 = WHV_MAP_GPA_RANGE_FLAGS_WHvMapGpaRangeFlagWrite;
 pub const PERM_EXECUTE: i32 = WHV_MAP_GPA_RANGE_FLAGS_WHvMapGpaRangeFlagExecute;
 pub const PERM_DIRTY:   i32 = WHV_MAP_GPA_RANGE_FLAGS_WHvMapGpaRangeFlagTrackDirtyPages;
 
+/// Get the identifier for this processor
+fn get_cpu_string() -> String {
+    let mut buf = [0u8; 48];
+
+    unsafe {
+        asm!(r#"
+
+            mov eax, 0x80000002
+            cpuid
+            mov [$0 + 0*4], eax
+            mov [$0 + 1*4], ebx
+            mov [$0 + 2*4], ecx
+            mov [$0 + 3*4], edx
+
+            mov eax, 0x80000003
+            cpuid
+            mov [$0 + 4*4], eax
+            mov [$0 + 5*4], ebx
+            mov [$0 + 6*4], ecx
+            mov [$0 + 7*4], edx
+
+            mov eax, 0x80000004
+            cpuid
+            mov [$0 +  8*4], eax
+            mov [$0 +  9*4], ebx
+            mov [$0 + 10*4], ecx
+            mov [$0 + 11*4], edx
+
+        "# :: "r"(buf.as_mut_ptr() as usize) :
+        "cc", "memory", "rax", "rbx", "rcx", "rdx" : "volatile", "intel");
+    }
+
+    String::from_utf8_lossy(&buf).into()
+}
+
 /// Entire context name list for a processor using all possible fields WHVP
 /// allows access to
 /// 
@@ -61,7 +96,6 @@ const WHVP_CONTEXT_NAMES: &[i32] = &[
     WHV_REGISTER_NAME_WHvX64RegisterDr3,
     WHV_REGISTER_NAME_WHvX64RegisterDr6,
     WHV_REGISTER_NAME_WHvX64RegisterDr7,
-    WHV_REGISTER_NAME_WHvX64RegisterXCr0,
     WHV_REGISTER_NAME_WHvX64RegisterXmm0,
     WHV_REGISTER_NAME_WHvX64RegisterXmm1,
     WHV_REGISTER_NAME_WHvX64RegisterXmm2,
@@ -110,6 +144,7 @@ const WHVP_CONTEXT_NAMES: &[i32] = &[
     //WHV_REGISTER_NAME_WHvRegisterPendingEvent,
     //WHV_REGISTER_NAME_WHvX64RegisterDeliverabilityNotifications,
     //WHV_REGISTER_NAME_WHvRegisterInternalActivityState,
+    WHV_REGISTER_NAME_WHvX64RegisterXCr0,
 ];
 
 /// Entire context structure for a processor using all possible fields WHVP
@@ -167,8 +202,6 @@ pub struct WhvpContext {
     pub dr6: WHV_REGISTER_VALUE,
     pub dr7: WHV_REGISTER_VALUE,
 
-    pub xcr0: WHV_REGISTER_VALUE,
-
     pub xmm0: WHV_REGISTER_VALUE,
     pub xmm1: WHV_REGISTER_VALUE,
     pub xmm2: WHV_REGISTER_VALUE,
@@ -221,12 +254,19 @@ pub struct WhvpContext {
     //pub pending_event: WHV_REGISTER_VALUE,
     //pub deliverability_notifications: WHV_REGISTER_VALUE,
     //pub internal_activity_state: WHV_REGISTER_VALUE, unknown type
+
+    pub xcr0: WHV_REGISTER_VALUE,
 }
 
 impl WhvpContext {
     /// Gets the linear address for RIP
     pub fn rip(&self) -> u64 {
         unsafe { self.cs.Segment.Base.wrapping_add(self.rip.Reg64) }
+    }
+
+    /// Gets the CR3 for the VM with the reserved and PCID bits masked off
+    pub fn cr3(&self) -> u64 {
+        unsafe { self.cr3.Reg64 & 0xFFFFFFFFFF000 }
     }
 }
 
@@ -419,14 +459,273 @@ pub struct Whvp {
 
     /// Number of cycles to enter the VM, fault, and exit
     vm_run_overhead: u64,
+
+    /// Supported features for WHVP
+    _whvp_features: WHV_CAPABILITY_FEATURES,
+
+    /// Supported processor features
+    _proc_features: WHV_PROCESSOR_FEATURES,
+
+    /// Supported xsave features
+    /// If xsave is not supported by WHVP this is a `None` value
+    xsave_features: Option<WHV_PROCESSOR_XSAVE_FEATURES>,
+
+    /// List of mapped memory regions in the hypervisor
+    /// Tuple is (paddr, size), both size and paddr should be 4 KiB aligned
+    memory_regions: Vec<(usize, usize)>,
+
+    /// Buffer to hold the dirty bitmaps. We just cache this allocation for
+    /// performance
+    dirty_bitmap_tmp: Vec<u64>,
+
+    /// Tracks if memory can be dirty. This is set when we run the guest, and
+    /// cleared when we clear dirty memory. It's an optimization for not doing
+    /// anything to clear dirty memory when we haven't run the hypervisor.
+    memory_dirty: bool,
 }
 
 impl Whvp {
     /// Create a new WHVP instance with one processor
     pub fn new() -> Self {
+        // Print the CPU model string
+        print!("Processor model string: {}\n", get_cpu_string());
+
+        // Check if WHVP is present
+        let mut present_check: BOOL = 0;
+        let mut bread = 0u32;
+        let res = unsafe { WHvGetCapability(
+            WHV_CAPABILITY_CODE_WHvCapabilityCodeHypervisorPresent,
+            &mut present_check as *mut BOOL as *mut c_void,
+            std::mem::size_of_val(&present_check) as u32,
+            &mut bread) };
+        assert!(res == 0, "WHvGetCapability() error: {:#x}", res);
+        assert!(bread == std::mem::size_of_val(&present_check) as u32,
+            "Failed to get WHvCapabilityCodeHypervisorPresent");
+        assert!(present_check != 0,
+            "Hypervisor not present, enable it in Windows features");
+
+        // Get WHVP features
+        let mut whvp_features: WHV_CAPABILITY_FEATURES =
+            unsafe { std::mem::zeroed() };
+        let mut bread = 0u32;
+        let res = unsafe { WHvGetCapability(
+            WHV_CAPABILITY_CODE_WHvCapabilityCodeFeatures,
+            &mut whvp_features as *mut WHV_CAPABILITY_FEATURES as *mut c_void,
+            std::mem::size_of_val(&whvp_features) as u32,
+            &mut bread) };
+        assert!(res == 0, "WHvGetCapability() error: {:#x}", res);
+        assert!(bread == std::mem::size_of_val(&whvp_features) as u32,
+            "Failed to get WHvCapabilityCodeFeatures");
+
+        // Display the feature set for WHVP
+        unsafe {
+            print!("WHVP detected with features:\n\
+                    \tPartialUnmap:       {}\n\
+                    \tLocalApicEmulation: {}\n\
+                    \tXsave:              {}\n\
+                    \tDirtyPageTracking:  {}\n\
+                    \tSpeculationControl: {}\n",
+                whvp_features.__bindgen_anon_1.PartialUnmap() != 0,
+                whvp_features.__bindgen_anon_1.LocalApicEmulation() != 0,
+                whvp_features.__bindgen_anon_1.Xsave() != 0,
+                whvp_features.__bindgen_anon_1.DirtyPageTracking() != 0,
+                whvp_features.__bindgen_anon_1.SpeculationControl() != 0);
+        }
+
+        // Get CPU features
+        let mut proc_features: WHV_PROCESSOR_FEATURES =
+            unsafe { std::mem::zeroed() };
+        let mut bread = 0u32;
+        let res = unsafe { WHvGetCapability(
+            WHV_CAPABILITY_CODE_WHvCapabilityCodeProcessorFeatures,
+            &mut proc_features as *mut WHV_PROCESSOR_FEATURES as *mut c_void,
+            std::mem::size_of_val(&proc_features) as u32,
+            &mut bread) };
+        assert!(res == 0, "WHvGetCapability() error: {:#x}", res);
+        assert!(bread == std::mem::size_of_val(&proc_features) as u32,
+            "Failed to get WHvCapabilityCodeProcessorFeatures");
+
+        unsafe {
+            print!("Processor detected with features:\n\
+                    \tSse3Support               {}\n\
+                    \tLahfSahfSupport           {}\n\
+                    \tSsse3Support              {}\n\
+                    \tSse4_1Support             {}\n\
+                    \tSse4_2Support             {}\n\
+                    \tSse4aSupport              {}\n\
+                    \tXopSupport                {}\n\
+                    \tPopCntSupport             {}\n\
+                    \tCmpxchg16bSupport         {}\n\
+                    \tAltmovcr8Support          {}\n\
+                    \tLzcntSupport              {}\n\
+                    \tMisAlignSseSupport        {}\n\
+                    \tMmxExtSupport             {}\n\
+                    \tAmd3DNowSupport           {}\n\
+                    \tExtendedAmd3DNowSupport   {}\n\
+                    \tPage1GbSupport            {}\n\
+                    \tAesSupport                {}\n\
+                    \tPclmulqdqSupport          {}\n\
+                    \tPcidSupport               {}\n\
+                    \tFma4Support               {}\n\
+                    \tF16CSupport               {}\n\
+                    \tRdRandSupport             {}\n\
+                    \tRdWrFsGsSupport           {}\n\
+                    \tSmepSupport               {}\n\
+                    \tEnhancedFastStringSupport {}\n\
+                    \tBmi1Support               {}\n\
+                    \tBmi2Support               {}\n\
+                    \tMovbeSupport              {}\n\
+                    \tNpiep1Support             {}\n\
+                    \tDepX87FPUSaveSupport      {}\n\
+                    \tRdSeedSupport             {}\n\
+                    \tAdxSupport                {}\n\
+                    \tIntelPrefetchSupport      {}\n\
+                    \tSmapSupport               {}\n\
+                    \tHleSupport                {}\n\
+                    \tRtmSupport                {}\n\
+                    \tRdtscpSupport             {}\n\
+                    \tClflushoptSupport         {}\n\
+                    \tClwbSupport               {}\n\
+                    \tShaSupport                {}\n\
+                    \tX87PointersSavedSupport   {}\n\
+                    \tInvpcidSupport            {}\n\
+                    \tIbrsSupport               {}\n\
+                    \tStibpSupport              {}\n\
+                    \tIbpbSupport               {}\n\
+                    \tSsbdSupport               {}\n\
+                    \tFastShortRepMovSupport    {}\n\
+                    \tRdclNo                    {}\n\
+                    \tIbrsAllSupport            {}\n\
+                    \tSsbNo                     {}\n\
+                    \tRsbANo                    {}\n",
+                proc_features.__bindgen_anon_1.Sse3Support() != 0,
+                proc_features.__bindgen_anon_1.LahfSahfSupport() != 0,
+                proc_features.__bindgen_anon_1.Ssse3Support() != 0,
+                proc_features.__bindgen_anon_1.Sse4_1Support() != 0,
+                proc_features.__bindgen_anon_1.Sse4_2Support() != 0,
+                proc_features.__bindgen_anon_1.Sse4aSupport() != 0,
+                proc_features.__bindgen_anon_1.XopSupport() != 0,
+                proc_features.__bindgen_anon_1.PopCntSupport() != 0,
+                proc_features.__bindgen_anon_1.Cmpxchg16bSupport() != 0,
+                proc_features.__bindgen_anon_1.Altmovcr8Support() != 0,
+                proc_features.__bindgen_anon_1.LzcntSupport() != 0,
+                proc_features.__bindgen_anon_1.MisAlignSseSupport() != 0,
+                proc_features.__bindgen_anon_1.MmxExtSupport() != 0,
+                proc_features.__bindgen_anon_1.Amd3DNowSupport() != 0,
+                proc_features.__bindgen_anon_1.ExtendedAmd3DNowSupport() != 0,
+                proc_features.__bindgen_anon_1.Page1GbSupport() != 0,
+                proc_features.__bindgen_anon_1.AesSupport() != 0,
+                proc_features.__bindgen_anon_1.PclmulqdqSupport() != 0,
+                proc_features.__bindgen_anon_1.PcidSupport() != 0,
+                proc_features.__bindgen_anon_1.Fma4Support() != 0,
+                proc_features.__bindgen_anon_1.F16CSupport() != 0,
+                proc_features.__bindgen_anon_1.RdRandSupport() != 0,
+                proc_features.__bindgen_anon_1.RdWrFsGsSupport() != 0,
+                proc_features.__bindgen_anon_1.SmepSupport() != 0,
+                proc_features.__bindgen_anon_1.EnhancedFastStringSupport() != 0,
+                proc_features.__bindgen_anon_1.Bmi1Support() != 0,
+                proc_features.__bindgen_anon_1.Bmi2Support() != 0,
+                proc_features.__bindgen_anon_1.MovbeSupport() != 0,
+                proc_features.__bindgen_anon_1.Npiep1Support() != 0,
+                proc_features.__bindgen_anon_1.DepX87FPUSaveSupport() != 0,
+                proc_features.__bindgen_anon_1.RdSeedSupport() != 0,
+                proc_features.__bindgen_anon_1.AdxSupport() != 0,
+                proc_features.__bindgen_anon_1.IntelPrefetchSupport() != 0,
+                proc_features.__bindgen_anon_1.SmapSupport() != 0,
+                proc_features.__bindgen_anon_1.HleSupport() != 0,
+                proc_features.__bindgen_anon_1.RtmSupport() != 0,
+                proc_features.__bindgen_anon_1.RdtscpSupport() != 0,
+                proc_features.__bindgen_anon_1.ClflushoptSupport() != 0,
+                proc_features.__bindgen_anon_1.ClwbSupport() != 0,
+                proc_features.__bindgen_anon_1.ShaSupport() != 0,
+                proc_features.__bindgen_anon_1.X87PointersSavedSupport() != 0,
+                proc_features.__bindgen_anon_1.InvpcidSupport() != 0,
+                proc_features.__bindgen_anon_1.IbrsSupport() != 0,
+                proc_features.__bindgen_anon_1.StibpSupport() != 0,
+                proc_features.__bindgen_anon_1.IbpbSupport() != 0,
+                proc_features.__bindgen_anon_1.SsbdSupport() != 0,
+                proc_features.__bindgen_anon_1.FastShortRepMovSupport() != 0,
+                proc_features.__bindgen_anon_1.RdclNo() != 0,
+                proc_features.__bindgen_anon_1.IbrsAllSupport() != 0,
+                proc_features.__bindgen_anon_1.SsbNo() != 0,
+                proc_features.__bindgen_anon_1.RsbANo() != 0);
+        }
+
+        // Get xsave features
+        let mut xsave_features = None;
+        if unsafe { whvp_features.__bindgen_anon_1.Xsave() != 0 } {
+            let mut tmp: WHV_PROCESSOR_XSAVE_FEATURES =
+                unsafe { std::mem::zeroed() };
+
+            let mut bread = 0u32;
+            let res = unsafe { WHvGetCapability(
+                WHV_CAPABILITY_CODE_WHvCapabilityCodeProcessorXsaveFeatures,
+                &mut tmp as *mut WHV_PROCESSOR_XSAVE_FEATURES as *mut c_void,
+                std::mem::size_of_val(&tmp) as u32,
+                &mut bread) };
+            assert!(res == 0, "WHvGetCapability() error: {:#x}", res);
+            assert!(bread == std::mem::size_of_val(&tmp) as u32,
+                "Failed to get WHvCapabilityCodeProcessorXsaveFeatures");
+
+            unsafe {
+                print!("Processor detected with features:\n\
+                        \tXsaveSupport              {}\n\
+                        \tXsaveoptSupport           {}\n\
+                        \tAvxSupport                {}\n\
+                        \tAvx2Support               {}\n\
+                        \tFmaSupport                {}\n\
+                        \tMpxSupport                {}\n\
+                        \tAvx512Support             {}\n\
+                        \tAvx512DQSupport           {}\n\
+                        \tAvx512CDSupport           {}\n\
+                        \tAvx512BWSupport           {}\n\
+                        \tAvx512VLSupport           {}\n\
+                        \tXsaveCompSupport          {}\n\
+                        \tXsaveSupervisorSupport    {}\n\
+                        \tXcr1Support               {}\n\
+                        \tAvx512BitalgSupport       {}\n\
+                        \tAvx512IfmaSupport         {}\n\
+                        \tAvx512VBmiSupport         {}\n\
+                        \tAvx512VBmi2Support        {}\n\
+                        \tAvx512VnniSupport         {}\n\
+                        \tGfniSupport               {}\n\
+                        \tVaesSupport               {}\n\
+                        \tAvx512VPopcntdqSupport    {}\n\
+                        \tVpclmulqdqSupport         {}\n",
+                        tmp.__bindgen_anon_1.XsaveSupport() != 0,
+                        tmp.__bindgen_anon_1.XsaveoptSupport() != 0,
+                        tmp.__bindgen_anon_1.AvxSupport() != 0,
+                        tmp.__bindgen_anon_1.Avx2Support() != 0,
+                        tmp.__bindgen_anon_1.FmaSupport() != 0,
+                        tmp.__bindgen_anon_1.MpxSupport() != 0,
+                        tmp.__bindgen_anon_1.Avx512Support() != 0,
+                        tmp.__bindgen_anon_1.Avx512DQSupport() != 0,
+                        tmp.__bindgen_anon_1.Avx512CDSupport() != 0,
+                        tmp.__bindgen_anon_1.Avx512BWSupport() != 0,
+                        tmp.__bindgen_anon_1.Avx512VLSupport() != 0,
+                        tmp.__bindgen_anon_1.XsaveCompSupport() != 0,
+                        tmp.__bindgen_anon_1.XsaveSupervisorSupport() != 0,
+                        tmp.__bindgen_anon_1.Xcr1Support() != 0,
+                        tmp.__bindgen_anon_1.Avx512BitalgSupport() != 0,
+                        tmp.__bindgen_anon_1.Avx512IfmaSupport() != 0,
+                        tmp.__bindgen_anon_1.Avx512VBmiSupport() != 0,
+                        tmp.__bindgen_anon_1.Avx512VBmi2Support() != 0,
+                        tmp.__bindgen_anon_1.Avx512VnniSupport() != 0,
+                        tmp.__bindgen_anon_1.GfniSupport() != 0,
+                        tmp.__bindgen_anon_1.VaesSupport() != 0,
+                        tmp.__bindgen_anon_1.Avx512VPopcntdqSupport() != 0,
+                        tmp.__bindgen_anon_1.VpclmulqdqSupport() != 0);
+            }
+
+            xsave_features = Some(tmp);
+        }
+
         // Create a new WHVP partition
         let mut partition: WHV_PARTITION_HANDLE = std::ptr::null_mut();
         let res = unsafe { WHvCreatePartition(&mut partition) };
+        if res == 0x80070005u32 as i32 {
+            panic!("Windows Hypervisor Platform now requires Admin access, please rerun this application as Administrator!")
+        }
         assert!(res == 0, "WHvCreatePartition() error: {:#x}", res);
 
         // Create the partition object now which will make a destructor if we
@@ -435,6 +734,12 @@ impl Whvp {
             partition,
             virtual_processors: Vec::new(),
             vm_run_overhead: !0,
+            _whvp_features: whvp_features,
+            _proc_features: proc_features,
+            xsave_features,
+            memory_regions: Vec::new(),
+            dirty_bitmap_tmp: vec![0u64; (4*1024*1024*1024) / (4096 * 64)],
+            memory_dirty: false,
         };
 
         // Register that we only want one processor
@@ -446,9 +751,23 @@ impl Whvp {
         };
         assert!(res == 0, "WHvSetPartitionProperty() error: {:#x}", res);
 
+        // _HV_X64_INTERRUPT_CONTROLLER_STATE
+        // APIC emulation
+        /*
+        let apic_mode = WHV_X64_LOCAL_APIC_EMULATION_MODE_WHvX64LocalApicEmulationModeXApic;
+        let res = unsafe { WHvSetPartitionProperty(partition,
+            WHV_PARTITION_PROPERTY_CODE_WHvPartitionPropertyCodeLocalApicEmulationMode,
+            &apic_mode as *const i32 as *const c_void,
+            std::mem::size_of_val(&apic_mode) as u32)
+        };
+        assert!(res == 0, "WHvSetPartitionProperty() error: {:#x}", res);*/
+
+        // Enable vmexits on certain events
         let mut vmexits: WHV_EXTENDED_VM_EXITS = unsafe { std::mem::zeroed() };
         unsafe {
             vmexits.__bindgen_anon_1.set_ExceptionExit(1);
+            vmexits.__bindgen_anon_1.set_X64MsrExit(1);
+            vmexits.__bindgen_anon_1.set_X64CpuidExit(1);
         }
         let res = unsafe { WHvSetPartitionProperty(partition,
             WHV_PARTITION_PROPERTY_CODE_WHvPartitionPropertyCodeExtendedVmExits,
@@ -456,11 +775,13 @@ impl Whvp {
             std::mem::size_of_val(&vmexits) as u32)
         };
         assert!(res == 0, "WHvSetPartitionProperty() error: {:#x}", res);
-        let eeb: u64 = 1 << 1;
+
+        // Set the vmexit bitmap
+        let vmexit_bitmap: u64 = 1 << 1;
         let res = unsafe { WHvSetPartitionProperty(partition,
             WHV_PARTITION_PROPERTY_CODE_WHvPartitionPropertyCodeExceptionExitBitmap,
-            &eeb as *const u64 as *const c_void,
-            std::mem::size_of_val(&eeb) as u32)
+            &vmexit_bitmap as *const u64 as *const c_void,
+            std::mem::size_of_val(&vmexit_bitmap) as u32)
         };
         assert!(res == 0, "WHvSetPartitionProperty() error: {:#x}", res);
 
@@ -541,10 +862,73 @@ impl Whvp {
         assert!(backing.len() > 0, "Cannot map zero bytes");
 
         // Map the memory in!
+        // Always mark mapped memory as tracked for dirty changes
         let res = unsafe { WHvMapGpaRange(self.partition,
             backing.as_mut_ptr() as *mut c_void, addr as u64,
-            backing.len() as u64, perm) };
+            backing.len() as u64, perm | PERM_DIRTY) };
         assert!(res == 0, "WHvMapGpaRange() error: {:#x}", res);
+
+        // Save that we mapped this memory region
+        self.memory_regions.push((addr, backing.len()));
+    }
+
+    // benchmarking
+    // xperf -on base -stackwalk profile
+    // <run benchmark>
+    // xperf -d trace.etl
+    pub fn get_dirty_list(&mut self, dirty_bits_l1: &mut [u64],
+            dirty_bits_l2: &mut [u64]) {
+        // Nothing to do if we haven't run the hypervisor since the last reset
+        if !self.memory_dirty { return; }
+        
+        unsafe {
+            let bitmap = &mut self.dirty_bitmap_tmp;
+
+            assert!(self._whvp_features.__bindgen_anon_1.DirtyPageTracking() != 0,
+                "Dirty page tracking not supported in your version of Windows.\
+                 You need a modern Windows build (17763 or newer)\
+                 Check your version with the `winver` command. To get on this\
+                 build as of Jan 2019 you need to be on the SAC (Targeted)\
+                 branch. You could also use an insider build (fast or slow)");
+
+            // For each memory region get the dirty bitmap
+            for &(paddr, size) in self.memory_regions.iter() {
+                // This is paranoid, we should never have non-aligned entries
+                // here in the first place.
+                assert!(paddr & 0xfff == 0 && size & 0xfff == 0);
+
+                let res = WHvQueryGpaRangeDirtyBitmap(self.partition,
+                    paddr as u64, size as u64, bitmap.as_mut_ptr(),
+                    std::mem::size_of_val(bitmap.as_slice()) as u32);
+                assert!(res == 0,
+                    "WHvQueryGpaRangeDirtyBitmap() error: {:#x}", res);
+
+                let qwords_in_map = size / (4096 * 64);
+                for (ii, qword) in bitmap[..qwords_in_map]
+                        .iter_mut().enumerate() {
+                    // Nothing dirty here
+                    if *qword == 0 { continue; }
+
+                    // Compute address of this qword
+                    let addr = paddr + ii * 4096 * 64;
+
+                    // Set the dirty bit in the first level (1 MiB) dirty bit
+                    // table
+                    let qword_l1 = addr / (1024 * 1024 * 64);
+                    let bit_l1   = (addr / (1024 * 1024)) % 64;
+                    dirty_bits_l1[qword_l1] |= 1 << bit_l1;
+
+                    // Set the dirty bits in the 4 KiB list. This has the same
+                    // layout as the dirty map we get from
+                    // WHvQueryGpaRangeDirtyBitmap so we can just or the bits in
+                    let qword_l2 = addr / (4096 * 64);
+                    dirty_bits_l2[qword_l2] |= *qword;
+                }
+            }
+        }
+
+        // Memory can no longer be dirty as we've restored it
+        self.memory_dirty = false;
     }
 
     // Run the hypervisor until exit, returning the exit context
@@ -555,6 +939,10 @@ impl Whvp {
             &mut context as *mut WHV_RUN_VP_EXIT_CONTEXT as *mut c_void,
             std::mem::size_of_val(&context) as u32) };
         assert!(res == 0, "WHvRunVirtualProcessor() error: {:#x}", res);
+
+        // Mark that memory may be dirty
+        self.memory_dirty = true;
+
         context
     }
 
@@ -563,9 +951,24 @@ impl Whvp {
         // Make room for the context
         let mut ret: WhvpContext = unsafe { std::mem::zeroed() };
 
+        // Check if xsave is supported
+        let xsave_supported = self.xsave_features.map(|x| {
+            unsafe { x.__bindgen_anon_1.XsaveSupport() != 0 }
+        });
+
+        // If xsave is not supported make sure we do not sync xcr0
+        let names = if xsave_supported == Some(true) {
+            WHVP_CONTEXT_NAMES.len()
+        } else {
+            // Don't use xcr0
+            assert!(WHVP_CONTEXT_NAMES[WHVP_CONTEXT_NAMES.len() - 1] == 
+                WHV_REGISTER_NAME_WHvX64RegisterXCr0);
+            WHVP_CONTEXT_NAMES.len() - 1
+        };
+
         // Get the state
         let res = unsafe { WHvGetVirtualProcessorRegisters(self.partition, 0,
-            WHVP_CONTEXT_NAMES.as_ptr(), WHVP_CONTEXT_NAMES.len() as u32,
+            WHVP_CONTEXT_NAMES.as_ptr(), names as u32,
             &mut ret as *mut WhvpContext as *mut WHV_REGISTER_VALUE) };
         assert!(res == 0, "WHvGetVirtualProcessorRegisters() error: {:#x}", res);
         ret
@@ -573,16 +976,83 @@ impl Whvp {
 
     // Commit the entire WHVP context structure state to the hypervisor state
     pub fn set_context(&mut self, context: &WhvpContext) {
+        // Check if xsave is supported
+        let xsave_supported = self.xsave_features.map(|x| {
+            unsafe { x.__bindgen_anon_1.XsaveSupport() != 0 }
+        });
+
+        // If xsave is not supported make sure we do not sync xcr0
+        let names = if xsave_supported == Some(true) {
+            WHVP_CONTEXT_NAMES.len()
+        } else {
+            // Don't use xcr0
+            assert!(WHVP_CONTEXT_NAMES[WHVP_CONTEXT_NAMES.len() - 1] == 
+                WHV_REGISTER_NAME_WHvX64RegisterXCr0);
+            WHVP_CONTEXT_NAMES.len() - 1
+        };
+
         // Apply the state
         let res = unsafe { WHvSetVirtualProcessorRegisters(self.partition, 0,
-            WHVP_CONTEXT_NAMES.as_ptr(), WHVP_CONTEXT_NAMES.len() as u32,
+            WHVP_CONTEXT_NAMES.as_ptr(), names as u32,
             context as *const WhvpContext as *const WHV_REGISTER_VALUE) };
-        assert!(res == 0,
-            "WHvSetVirtualProcessorRegisters() error: {:#x}\n{}",
-            res, context);
+
+        if res != 0 {
+            print!("Likely unsupported virtual processor register\n");
+            print!("Please open a ticket with your CPU string:\n");
+            print!("    CPU string: \"{}\"\n", get_cpu_string());
+
+            assert!(res == 0,
+                "WHvSetVirtualProcessorRegisters() error: {:#x}\n{}",
+                res, context);
+        }
     }
 
-    // Clear a pending exception
+    /// Request that an exception is delivered to the guest based on `vector`
+    /// and `error_code`. If `error_code` is `None` then no error code will
+    /// be pushed onto the stack for the exception
+    pub fn deliver_exception(&mut self, vector: u8, error_code: Option<u32>) {
+        // List of names
+        const REGINT_NAMES: &[i32] = &[
+            WHV_REGISTER_NAME_WHvRegisterPendingEvent
+        ];
+
+        let mut event: WHV_X64_PENDING_EXCEPTION_EVENT =
+            unsafe { std::mem::zeroed() };
+
+        // Get current exception event state
+        let res = unsafe { WHvGetVirtualProcessorRegisters(self.partition, 0,
+            REGINT_NAMES.as_ptr(), REGINT_NAMES.len() as u32,
+            &mut event as *mut WHV_X64_PENDING_EXCEPTION_EVENT as
+            *mut WHV_REGISTER_VALUE) };
+        assert!(res == 0,
+            "WHvGetVirtualProcessorRegisters() error: {:#x}",
+            res);
+
+        unsafe {
+            // Make sure there's not already a pending exception event
+            assert!(event.__bindgen_anon_1.EventPending() == 0,
+                "Can't deliver exception when one is already pending");
+
+            event.__bindgen_anon_1.set_EventPending(1);
+            event.__bindgen_anon_1.set_EventType(
+                WHV_X64_PENDING_EVENT_TYPE_WHvX64PendingEventException as u32);
+            event.__bindgen_anon_1.set_DeliverErrorCode(
+                if error_code.is_none() { 0 } else { 1 });
+            event.__bindgen_anon_1.set_Vector(vector as u32);
+            event.__bindgen_anon_1.ErrorCode = error_code.unwrap_or(0);
+            event.__bindgen_anon_1.ExceptionParameter = 0; // What is this?
+
+            let res = WHvSetVirtualProcessorRegisters(self.partition,
+                0, REGINT_NAMES.as_ptr(), REGINT_NAMES.len() as u32,
+                &event as *const WHV_X64_PENDING_EXCEPTION_EVENT as
+                *const WHV_REGISTER_VALUE);
+            assert!(res == 0,
+                "WHvSetVirtualProcessorRegisters() error: {:#x}",
+                res);
+        }
+    }
+
+    /// Clear a pending exception
     pub fn clear_pending_exception(&mut self) {
         // List of names
         const REGINT_NAMES: &[i32] = &[

@@ -1,4 +1,5 @@
-*.txt
-*.iso
-*.vhd
-symbols
+*
+
+!.gitignore
+!bochsrc.bxrc
+!run.bat
